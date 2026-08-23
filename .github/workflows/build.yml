@@ -1,0 +1,50 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Runs the SAME `just check` as a developer does, through the same nix dev
+  # shell. Installing the tools separately here is how a gate drifts from what
+  # it is supposed to gate — and how it ends up passing in one environment and
+  # failing in another.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Lint and test
+        run: nix develop --command just check
+
+  image:
+    needs: check
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Two tags on purpose. :latest is convenient; the immutable :sha- tag is
+      # what a deployment should pin, so a rollback is a one-line change in hat
+      # rather than a rebuild.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/gitsite:latest
+            ghcr.io/${{ github.repository_owner }}/gitsite:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
