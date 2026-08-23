@@ -169,6 +169,19 @@ sandbox
 setup > /dev/null 2>&1
 check "seeds a placeholder page before the first build" \
     "$([ -s "$GITSITE_WORK/site/index.html" ] && echo yes || echo no)" "yes"
+check "creates HOME" "$([ -d "$HOME" ] && echo yes || echo no)" "yes"
+teardown
+
+# --------------------------------------------------------------------------
+# Regression: the pod points TMPDIR at the volume so builds do not consume
+# ephemeral storage. setup() used not to create it, and nix then failed to
+# evaluate the dev shell — after which direnv fell back to an environment
+# without the app's toolchain and every build died on a missing `uv`.
+sandbox
+export TMPDIR="$GITSITE_WORK/tmp"
+setup > /dev/null 2>&1
+check "creates TMPDIR" "$([ -d "$TMPDIR" ] && echo yes || echo no)" "yes"
+unset TMPDIR
 teardown
 
 # --------------------------------------------------------------------------

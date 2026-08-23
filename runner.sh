@@ -27,7 +27,13 @@ die() { log "FATAL: $*"; exit 1; }
 # --------------------------------------------------------------- one-time setup
 
 setup() {
-    mkdir -p "$WORK" "${HOME:?HOME is required}" || die "cannot write to $WORK"
+    # TMPDIR too, and before anything else: nix builds the dev shell there, and
+    # a missing directory fails as "creating directory ...: No such file or
+    # directory" — after which direnv silently falls back to an environment
+    # without the app's toolchain, and the build dies on a missing `uv`. The
+    # pod sets TMPDIR onto the volume so builds do not eat ephemeral storage.
+    mkdir -p "$WORK" "${HOME:?HOME is required}" "${TMPDIR:-$WORK/tmp}" ||
+        die "cannot write to $WORK"
 
     if [ -r "$SSH_KEY" ]; then
         export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
