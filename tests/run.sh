@@ -32,6 +32,13 @@ sandbox() {
 case "$1" in
   allow) exit 0 ;;
   exec)  shift 2                       # drop "exec" and the directory
+         # NARHASH_ONCE=1: fail the first invocation the way nix does, so the
+         # retry path can be exercised.
+         if [ "${NARHASH_ONCE:-0}" = "1" ] && [ ! -e "$SB/narhash-seen" ]; then
+             touch "$SB/narhash-seen"
+             echo "error: mismatch in field 'narHash' of input"
+             exit 1
+         fi
          if [ "$1" = "git" ]; then exit "${LFS_EXIT:-0}"; fi
          if [ "$1" = "bash" ]; then
              [ "${BUILD_EXIT:-0}" = "0" ] || exit "${BUILD_EXIT}"
@@ -57,13 +64,14 @@ for a in "$@"; do
 done
 exit 0
 STUB
+    export SB
     chmod +x "$SB/bin"/*
     PATH="$SB/bin:$PATH"
     # shellcheck disable=SC1090
     source "$RUNNER"
 }
 
-teardown() { rm -rf "$SB"; unset BUILD_EXIT FETCH_EXIT LFS_EXIT BUILD_SIDE_EFFECT; }
+teardown() { rm -rf "$SB"; unset BUILD_EXIT FETCH_EXIT LFS_EXIT BUILD_SIDE_EFFECT NARHASH_ONCE; }
 
 # Write a gitsite.toml and an output directory containing one page.
 given_repo() { # build_ok out_dir [lfs]
@@ -190,6 +198,19 @@ given_published_site
 setup > /dev/null 2>&1
 check "does not overwrite an existing site with the placeholder" \
     "$(site_says)" "<h1>previous</h1>"
+teardown
+
+# --------------------------------------------------------------------------
+# Regression: a repo with git-lfs files makes nix abort with a narHash
+# mismatch. The retry used to wrap only the build — but the FIRST thing to
+# enter the environment is `git lfs pull`, so it never fired where the failure
+# actually happens. run_in_env now wraps both.
+sandbox
+given_repo produces_output out true
+export NARHASH_ONCE=1
+build_round > /dev/null 2>&1
+check "recovers from a narHash mismatch on the lfs step" "$?" "0"
+check "and publishes the build after the retry" "$(site_says)" "<h1>new</h1>"
 teardown
 
 echo

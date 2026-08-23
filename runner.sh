@@ -81,6 +81,31 @@ print("true" if value is True else "false" if value is False else value)
 PY
 }
 
+# Run a command inside the app's direnv environment, retrying once on the
+# git-lfs/nix narHash trap.
+#
+# A repo with git-lfs files has two contents for the same path: the pointer in
+# the git tree and the smudged file in the worktree. Nix hashes whichever it
+# ingested and aborts when a cached evaluation disagrees. One refresh clears it.
+#
+# This wraps EVERY direnv call, not just the build: the first thing that enters
+# the environment is `git lfs pull`, so guarding only the build meant the retry
+# never fired for the failure that actually happens first.
+run_in_env() {
+    local logf rc
+    logf=$(mktemp)
+    direnv exec . "$@" 2>&1 | tee "$logf"
+    rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ] && grep -q narHash "$logf"; then
+        log "narHash mismatch (git-lfs pointer vs smudged file) — refreshing and retrying once"
+        nix flake metadata --refresh > /dev/null 2>&1
+        direnv exec . "$@"
+        rc=$?
+    fi
+    rm -f "$logf"
+    return "$rc"
+}
+
 # One build round. Returns non-zero on any failure; the caller keeps the
 # previous site in that case.
 build_round() {
@@ -104,18 +129,10 @@ build_round() {
     # direnv environment exists — which is why this runs after direnv allow and
     # not as part of the fetch above.
     if [ "$lfs" = "true" ]; then
-        direnv exec . git lfs pull || { log "git lfs pull failed"; return 1; }
+        run_in_env git lfs pull || { log "git lfs pull failed"; return 1; }
     fi
 
-    if ! direnv exec . bash -c "$build"; then
-        # Known trap: with git-lfs files, nix hashes either the pointer (from
-        # the git tree) or the smudged file (from the worktree) depending on how
-        # the source was ingested, and aborts on the mismatch. One refresh fixes
-        # it; anything else is a real build failure.
-        log "build failed — retrying once after refreshing the nix eval cache"
-        nix flake metadata --refresh > /dev/null 2>&1
-        direnv exec . bash -c "$build" || { log "build failed"; return 1; }
-    fi
+    run_in_env bash -c "$build" || { log "build failed"; return 1; }
 
     [ -d "$CHECKOUT/$out" ] || { log "build produced no '$out' directory"; return 1; }
 
