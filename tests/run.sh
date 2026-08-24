@@ -213,6 +213,23 @@ check "recovers from a narHash mismatch on the lfs step" "$?" "0"
 check "and publishes the build after the retry" "$(site_says)" "<h1>new</h1>"
 teardown
 
+# --------------------------------------------------------------------------
+# `out` comes from a file in another repo. "." would publish the whole
+# checkout, .git and all — every commit the source repo ever had. Reject
+# anything that is not a path inside the repo.
+for bad in "." ".." "/etc" "../escape" "sub/../.."; do
+    sandbox
+    given_published_site
+    printf 'build = "just build"\nout = "%s"\nlfs = false\n' "$bad" \
+        > "$GITSITE_WORK/repo/gitsite.toml"
+    mkdir -p "$GITSITE_WORK/repo/sub"
+    build_round > /dev/null 2>&1
+    check "rejects out = '$bad'" "$?" "1"
+    check "  and keeps the previous site" "$(site_says)" "<h1>previous</h1>"
+    teardown
+done
+
+
 echo
 printf '%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

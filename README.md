@@ -1,12 +1,38 @@
 # gitsite
 
-En generisk container som följer ett git-repo, bygger om när något landat och
-servar resultatet. Samma image för alla sajter — skillnaden ligger i
+En byggcontainer som följer ett git-repo, bygger om när något landat och lägger
+resultatet i en katalog. Samma image för alla sajter — skillnaden ligger i
 konfigurationen.
 
-Den ersätter mönstret där en sajt byggs och servas som en bieffekt av
-utvecklingsmiljön: då dör sajten när utvecklingspodden startar om, den byggs
-bara vid podstart, och det som servas är arbetsträdet — ocommitterat och allt.
+Den ersätter mönstret där en sajt byggs som en bieffekt av utvecklingsmiljön:
+då dör sajten när utvecklingspodden startar om, den byggs bara vid podstart,
+och det som publiceras är arbetsträdet — ocommitterat och allt.
+
+## Vad den gör, och inte gör
+
+**gitsite bygger. Den servar inte.** Containern klonar, bygger och skriver
+resultatet till `/work/site`. Att exponera den katalogen på HTTP är någon
+annans jobb — en webbserver i samma pod, en sidovagn, en volym som en befintlig
+server läser. Vi kör den med `nginx-unprivileged` i samma pod, men ingenting i
+containern förutsätter just det.
+
+Den vet inte heller något om autentisering. Vad som står framför webbservern —
+en identity-proxy, basic auth, eller ingenting — är ditt val.
+
+## Förutsättning: appens repo måste ha nix och direnv
+
+Bygget körs som `direnv exec . <build>` i det klonade repot. Det förutsätter
+att repot har en `.envrc` och normalt en `flake.nix`.
+
+Skälet är att byggkommandon i praktiken anropar bara kommandonamn — `hugo`,
+`mkdocs build`, `python -m mysite` — som förutsätter en miljö någon redan satt
+upp. `nix develop -c` räcker inte när `.envrc` också gör något (installerar
+Python-beroenden, lägger `.venv/bin` på PATH); direnv gör allt.
+
+**Ett repo utan `.envrc` kan alltså inte byggas av gitsite i dag.** Vill du
+använda den till ett vanligt hugo- eller npm-projekt behöver du lägga till en
+`.envrc` som sätter upp verktygen, eller ändra runnern så att den kan hoppa
+över direnv. Det senare tas gärna emot som en PR.
 
 ## Konfigurationen är delad
 
@@ -18,48 +44,74 @@ bara vid podstart, och det som servas är arbetsträdet — ocommitterat och all
 | `GITSITE_REF` | `main` | grenen som följs |
 | `GITSITE_INTERVAL` | `120` | sekunder mellan pollningarna |
 | `GITSITE_SSH_KEY` | `/etc/gitsite/ssh` | privatnyckeln; saknas den antas anonym remote |
-| `GITSITE_WORK` | `/work` | klon, HOME och den servade katalogen |
+| `GITSITE_WORK` | `/work` | klonen och den byggda sajten (`$GITSITE_WORK/site`) |
+| `HOME` | *(krävs)* | skrivbar och beständig; direnv, uv och nix cachar där |
+| `TMPDIR` | `$GITSITE_WORK/tmp` | nix bygger devskalet här; lägg det på volymen, inte i containern |
+
+`HOME` **måste** sättas och peka någonstans skrivbart — runnern avbryter
+direkt annars. Imagen sätter `HOME=/home/gitsite`, vilket fungerar men ligger i
+containerns eget lager: sätt den till något beständigt, annars hämtas alla
+beroenden om vid varje omstart.
 
 **Appen äger** hur den byggs, i en `gitsite.toml` i repots rot:
 
 ```toml
-build = "just place && just build"   # kommandot som producerar sajten
-out   = "out"                        # katalogen det lägger resultatet i
-lfs   = true                         # kör git lfs pull före bygget
+build = "just build"     # kommandot som producerar sajten
+out   = "public"         # katalogen det lägger resultatet i, relativt repots rot
+lfs   = false            # kör git lfs pull före bygget
 ```
+
+`out` måste peka inuti repot. `.`, absoluta sökvägar och sökvägar som går uppåt
+avvisas — annars hade `out = "."` publicerat hela checkouten inklusive `.git`,
+och därmed appens hela historik.
 
 Att byggkommandot bor i appen är avsiktligt: den som byter utkatalog ändrar
 filen i samma commit som orsakar bytet. Priset är att ett trasigt byggkommando
-upptäcks först i podden — därför behandlas en saknad eller ogiltig
+upptäcks först i containern — därför behandlas en saknad eller ogiltig
 `gitsite.toml` som ett byggfel, och den förra sajten står kvar.
 
-## Hur bygget körs
+## Kom igång
 
-Runnern går in i appens **egen** nix-miljö via direnv:
-
+```bash
+docker run --rm \
+  -e GITSITE_REPO=https://github.com/dig/din-sajt.git \
+  -e HOME=/work/home \
+  -v gitsite-data:/work \
+  ghcr.io/jonatanolofsson/gitsite:latest
 ```
-direnv allow . && direnv exec . <build>
-```
 
-Inte `nix develop`: byggkommandona anropar oftast bara kommandonamn
-(`plotdata app`, `python -m markplan.site`) som förutsätter att `.envrc` kört
-`uv sync` och lagt `.venv/bin` på PATH. Flaken ensam räcker inte.
+Sajten hamnar i `/work/site`. Peka en webbserver på den katalogen — **inte på
+en montering av den**, se nedan.
 
-Ordningen spelar roll när `lfs = true`: `git-lfs` kommer ur appens flake, så
-`git lfs pull` måste köras *efter* att direnv-miljön finns, inte som en del av
-klonen.
+Första bygget tar minuter, inte sekunder: nix hämtar appens beroenden och
+cachar dem i `HOME` och `/nix`.
 
 ## Vad som är garanterat
 
 - **Ett misslyckat bygge tar aldrig ner sajten.** Förra versionen står kvar och
   runnern försöker igen nästa varv.
-- **Bytet är atomiskt.** Bygget sker vid sidan om och katalogen byts med `mv`,
-  så en besökare aldrig ser ett halvskrivet resultat.
 - **Ett tomt pollvarv kostar ett nätanrop.** `git ls-remote` jämförs mot senast
   byggda commit; först vid skillnad hämtas något.
-- **Något servas från första sekunden.** Innan det första bygget är klart —
-  vilket kan ta 10–20 minuter medan beroenden cachas — ligger en enkel
-  "bygger…"-sida där, så att nginx inte svarar 403 på en tom katalog.
+- **Något finns i katalogen från första sekunden.** Innan det första bygget är
+  klart ligger en enkel "bygger…"-sida där, så att en webbserver inte svarar
+  403 på en tom katalog.
+
+## Kända begränsningar
+
+- **Publiceringen är inte atomär i strikt mening.** Bygget sker vid sidan om
+  och katalogen byts med två `mv` — mellan dem finns ett kort glapp där
+  `site/` inte existerar. Dör containern precis där ligger bygget kvar som
+  `site.new` och nästa varv publicerar om.
+- **Montera inte `site/` direkt.** Bytet ersätter katalogens inode, så en
+  bind-montering av just `site/` fortsätter peka på den gamla och servar första
+  bygget för alltid. Montera föräldern och låt webbservern lösa sökvägen per
+  förfrågan.
+- **Byggkommandot kommer från appens repo och körs som det står.** Den som kan
+  pusha till app-repot kan köra godtycklig kod i containern. Det är oundvikligt
+  — ett bygge *är* godtycklig kod — men det är skälet att deploy-nyckeln bör
+  vara read-only och per repo, och att containern inte bör ha några andra
+  rättigheter.
+- Ett repo utan `.envrc` stöds inte, se ovan.
 
 ## Utveckling
 
@@ -70,8 +122,14 @@ just lint      # shellcheck
 ```
 
 Testerna kör utan ramverk och stubbar `git`, `direnv` och `nix`. Tyngdpunkten
-ligger på felvägarna: att ett trasigt bygge behåller förra sajten, att bytet
-är atomiskt, och att en ogiltig `gitsite.toml` inte publiceras.
+ligger på felvägarna: att ett trasigt bygge behåller förra sajten, att en
+ogiltig `gitsite.toml` inte publiceras, och att `out` inte kan peka ut ur
+repot.
 
 Verktygen deklareras i `flake.nix` så att `just check` fungerar i varje miljö,
-inte bara där en python råkar vara installerad.
+inte bara där en python råkar vara installerad. CI kör exakt samma `just check`
+genom samma nix-skal.
+
+## Licens
+
+MIT, se [LICENSE](LICENSE).

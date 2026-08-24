@@ -13,6 +13,11 @@ jobs:
   # failing in another.
   check:
     runs-on: ubuntu-latest
+    # Read-only: this job runs code from the pull request, and on a public repo
+    # anyone can open one. A fork PR gets no secrets and a read-only token by
+    # default, but say it explicitly rather than rely on the repo setting.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main

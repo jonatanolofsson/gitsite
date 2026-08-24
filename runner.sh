@@ -134,6 +134,18 @@ build_round() {
 
     run_in_env bash -c "$build" || { log "build failed"; return 1; }
 
+    # `out` comes from a file in someone else's repo, so check it points at a
+    # subdirectory and nothing else. `out = "."` would publish the entire
+    # checkout — including .git, and with it every commit the source repo ever
+    # had. That is a bad afternoon for anyone whose history is not meant to be
+    # public, and the kind of mistake that is only obvious afterwards.
+    case "$out" in
+        "" | "." | ".." | /* | *"/../"* | */.. | ../*)
+            log "gitsite.toml: 'out' must be a path inside the repo, got '$out'"
+            return 1
+            ;;
+    esac
+
     [ -d "$CHECKOUT/$out" ] || { log "build produced no '$out' directory"; return 1; }
 
     # Atomic swap, never a build in place: a visitor must not be able to see a
