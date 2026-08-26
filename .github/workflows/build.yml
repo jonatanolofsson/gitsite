@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # GitHub has twice now accepted a push to main without creating a run for it.
+  # Without a manual trigger the only way to recover is an empty commit — junk
+  # history to work around someone else's dropped event. `gh workflow run Build`
+  # rebuilds the same commit instead.
+  workflow_dispatch:
 
 jobs:
   # Runs the SAME `just check` as a developer does, through the same nix dev
