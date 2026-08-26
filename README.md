@@ -122,6 +122,13 @@ cachar dem i `HOME` och `/nix`.
   vara read-only och per repo, och att containern inte bör ha några andra
   rättigheter.
 - Ett repo utan `.envrc` stöds inte, se ovan.
+- **Lägger du `/nix` på en volym som överlever imagen — slå ihop, seeda inte.**
+  Imagens `$HOME/.nix-profile` ligger i containerlagret men symlänkar in i
+  `/nix`. Kopierar du bara storen när volymen är tom fastnar den i den version
+  som råkade komma först, och en nyare image får ett profilbibliotek utan mål:
+  `direnv: command not found` vid varje bygge. `cp -a -n /nix/. <volym>/`
+  lägger till det som saknas utan att röra det som finns — säkert eftersom
+  store-sökvägar är innehållsadresserade och oföränderliga.
 
 ## Utveckling
 
@@ -139,6 +146,11 @@ repot.
 Verktygen deklareras i `flake.nix` så att `just check` fungerar i varje miljö,
 inte bara där en python råkar vara installerad. CI kör exakt samma `just check`
 genom samma nix-skal.
+
+Imagen pinnar både nix-versionen och nixpkgs-revisionen (`ARG` överst i
+`Dockerfile`). Revisionen är densamma som `flake.lock` — imagens direnv och
+utvecklingsskalet kommer ur samma nixpkgs. **Bumpa dem tillsammans**, annars
+säger repot en sak och imagen en annan.
 
 ## Licens
 
