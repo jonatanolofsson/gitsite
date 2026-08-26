@@ -286,6 +286,75 @@ check "publishes a real directory, not a link" \
     "$([ -L "$GITSITE_WORK/site" ] && echo link || echo dir)" "dir"
 teardown
 
+# --------------------------------------------------------------------------
+# The status file exists because a permanently failing build is INVISIBLE from
+# outside: the site keeps returning 200 with last week's content. These assert
+# the fields an alert would actually match on, not merely that a file appeared.
+status_field() { # key
+    python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" \
+        "$GITSITE_WORK/status.json" "$1" 2>/dev/null
+}
+
+sandbox
+mkdir -p "$GITSITE_WORK"
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_BUILT=""
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_SUCCESS=""
+write_status starting "" 0
+check "writes a status file" "$([ -f "$GITSITE_WORK/status.json" ] && echo yes || echo no)" "yes"
+check "status is valid json" "$(status_field state)" "starting"
+teardown
+
+sandbox
+mkdir -p "$GITSITE_WORK"
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_BUILT="abc123"
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_SUCCESS="2026-01-01T00:00:00Z"
+write_status ok "abc123" 0
+check "records the published sha" "$(status_field published)" "abc123"
+check "a good round reports zero failures" "$(status_field consecutive_failures)" "0"
+check "records the ref being followed" "$(status_field ref)" "main"
+teardown
+
+# The whole point: a stale site must be distinguishable from a healthy one.
+sandbox
+mkdir -p "$GITSITE_WORK"
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_BUILT="old111"
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_SUCCESS="2026-01-01T00:00:00Z"
+write_status failing "new222" 7
+check "a failing round says so" "$(status_field state)" "failing"
+check "and counts the failures" "$(status_field consecutive_failures)" "7"
+check "and still names the last good build" "$(status_field published)" "old111"
+check "and names the commit it could not build" "$(status_field attempted)" "new222"
+teardown
+
+# Never leak build output: the log carries the reason, the status file must not.
+sandbox
+mkdir -p "$GITSITE_WORK"
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_BUILT=""
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_SUCCESS=""
+write_status failing "deadbeef" 1
+check "status carries no error text" \
+    "$(python3 -c "import json;print('yes' if any('error' in k for k in json.load(open('$GITSITE_WORK/status.json'))) else 'no')" 2>/dev/null)" "no"
+teardown
+
+# A status write must never be what takes the runner down.
+sandbox
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_BUILT=""
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_SUCCESS=""
+rm -rf "$GITSITE_WORK"
+write_status ok "x" 0
+check "an unwritable status file is not fatal" "$?" "0"
+teardown
+
 echo
 printf '%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

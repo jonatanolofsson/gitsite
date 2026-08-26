@@ -106,6 +106,36 @@ cachar dem i `HOME` och `/nix`.
   klart ligger en enkel "bygger…"-sida där, så att en webbserver inte svarar
   403 på en tom katalog.
 
+## Att se om den mår bra
+
+Garantin ovan har en baksida: **ett bygge som misslyckas varje varv syns inte
+utifrån.** Sajten svarar 200 med förra veckans innehåll och ser fullt frisk ut.
+Därför skriver runnern `$GITSITE_WORK/status.json` efter varje varv:
+
+```json
+{"state":"failing","ref":"main","attempted":"9f2c…","published":"4a71…",
+ "consecutive_failures":7,"last_attempt":"2026-08-26T16:12:04Z",
+ "last_success":"2026-08-24T09:31:55Z"}
+```
+
+`state` är `ok`, `failing`, `unreachable` eller `starting`. Filen ligger
+**utanför** den servade katalogen — bytet ersätter den katalogen i sin helhet,
+och statusen angår driften, inte besökaren.
+
+Den bär medvetet ingen feltext. Orsaken står i loggen, som ändå läses när något
+är fel; att kopiera in byggutdata i en statusfil betyder att vad bygget än
+skrev — sökvägar, tokens, någon annans felmeddelande — hamnar någonstans det
+aldrig granskats för.
+
+Det billigaste larmet är på loggen, som skriver en räknare just för det:
+
+```
+keeping the previous site (failed 7 in a row)
+```
+
+En enstaka etta är en trasig commit som lagar sig själv. Ett tvåsiffrigt tal är
+en deploy ingen tittat på. Larma på det andra, inte på det första.
+
 ## Kända begränsningar
 
 - **Publiceringen är inte atomär i strikt mening.** Bygget sker vid sidan om

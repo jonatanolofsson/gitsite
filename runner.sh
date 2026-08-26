@@ -20,6 +20,14 @@ SSH_KEY=${GITSITE_SSH_KEY:-/etc/gitsite/ssh}
 WORK=${GITSITE_WORK:-/work}
 CHECKOUT="$WORK/repo"
 SITE="$WORK/site"
+# Deliberately NOT inside $SITE: the swap replaces that directory wholesale, and
+# anything in there is public. Status is for the operator, not the visitor.
+STATUS="$WORK/status.json"
+
+# Globals rather than locals in main(): write_status reads them, and the
+# alternative is threading two more arguments through every call site.
+LAST_BUILT=""
+LAST_SUCCESS=""
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { log "FATAL: $*"; exit 1; }
@@ -106,6 +114,25 @@ run_in_env() {
     return "$rc"
 }
 
+# A machine-readable answer to "is this thing still working?".
+#
+# The failure this exists for is silent: a build that fails every round keeps
+# serving the previous site forever, exactly as designed, and looks perfectly
+# healthy from outside. A site can be days stale while returning 200. This file
+# is the difference between noticing and not.
+#
+# It carries no error text on purpose. The reason belongs in the log, which is
+# already read by a human when something is wrong; copying build output into a
+# status file means whatever the build printed — paths, tokens, someone else's
+# error message — ends up somewhere it was never reviewed for.
+write_status() { # state attempted_sha consecutive_failures
+    local tmp
+    tmp=$(mktemp "$WORK/.status.XXXXXX" 2>/dev/null) || return 0
+    printf '{"state":"%s","ref":"%s","attempted":"%s","published":"%s","consecutive_failures":%s,"last_attempt":"%s","last_success":"%s"}\n' \
+        "$1" "$REF" "$2" "$LAST_BUILT" "$3" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$LAST_SUCCESS" > "$tmp"
+    mv "$tmp" "$STATUS" || rm -f "$tmp"
+}
+
 # One build round. Returns non-zero on any failure; the caller keeps the
 # previous site in that case.
 build_round() {
@@ -185,22 +212,32 @@ build_round() {
 
 main() {
     setup
-    local last_built="" remote
+    local remote fails=0
+    write_status starting "" 0
     while true; do
         # ls-remote rather than fetch: a round that finds nothing new costs one
         # network call, so the interval can be short without being expensive.
         remote=$(git -C "$CHECKOUT" ls-remote origin "$REF" 2>/dev/null | cut -f1)
         if [ -z "$remote" ]; then
-            log "cannot reach $REPO — retrying in ${INTERVAL}s"
-        elif [ "$remote" = "$last_built" ]; then
+            fails=$((fails + 1))
+            log "cannot reach $REPO — retrying in ${INTERVAL}s (failed $fails in a row)"
+            write_status unreachable "" "$fails"
+        elif [ "$remote" = "$LAST_BUILT" ]; then
             :
         else
             log "building $remote"
             if build_round; then
-                last_built=$remote
+                LAST_BUILT=$remote
+                LAST_SUCCESS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                fails=0
                 log "published $remote"
+                write_status ok "$remote" 0
             else
-                log "keeping the previous site"
+                fails=$((fails + 1))
+                # The count is the point. One failure is a bad commit and fixes
+                # itself; twenty is a broken deployment nobody has looked at.
+                log "keeping the previous site (failed $fails in a row)"
+                write_status failing "$remote" "$fails"
             fi
         fi
         sleep "$INTERVAL"
