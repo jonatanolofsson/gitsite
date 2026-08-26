@@ -90,6 +90,22 @@ given_published_site() {
 
 site_says() { cat "$GITSITE_WORK/site/index.html" 2> /dev/null; }
 
+# build_round has eight paths to `return 1`. Asserting only the return code
+# therefore proves nothing about WHICH check fired — four of the original five
+# `out` tests passed with the guard deleted, for unrelated reasons. Assert the
+# log line too.
+fails_with() { # beskrivning mönster
+    local out rc
+    out=$(build_round 2>&1); rc=$?
+    if [ "$rc" -eq 0 ]; then
+        nope "$1" "build_round lyckades, väntade fel"
+    elif printf '%s' "$out" | grep -q "$2"; then
+        ok "$1"
+    else
+        nope "$1" "fel orsak; väntade /$2/, fick: $(printf '%s' "$out" | tail -1)"
+    fi
+}
+
 echo "runner.sh"
 
 # --------------------------------------------------------------------------
@@ -214,21 +230,61 @@ check "and publishes the build after the retry" "$(site_says)" "<h1>new</h1>"
 teardown
 
 # --------------------------------------------------------------------------
-# `out` comes from a file in another repo. "." would publish the whole
-# checkout, .git and all — every commit the source repo ever had. Reject
-# anything that is not a path inside the repo.
-for bad in "." ".." "/etc" "../escape" "sub/../.."; do
+# `out` comes from a file in another repo, and the guard is what stops it
+# publishing .git — the source repo's entire history. Every case here asserts
+# the guard's own message, so the test fails if the guard is removed.
+for bad in "." "./" ".//" "./." ".." "/etc" "../escape" "sub/../.." ""; do
     sandbox
     given_published_site
     printf 'build = "just build"\nout = "%s"\nlfs = false\n' "$bad" \
         > "$GITSITE_WORK/repo/gitsite.toml"
     mkdir -p "$GITSITE_WORK/repo/sub"
-    build_round > /dev/null 2>&1
-    check "rejects out = '$bad'" "$?" "1"
+    fails_with "rejects out = '$bad'" "must be a directory inside the repo"
     check "  and keeps the previous site" "$(site_says)" "<h1>previous</h1>"
     teardown
 done
 
+# .git is inside the repo, so the path check alone lets it through.
+for bad in ".git" "sub/../.git"; do
+    sandbox
+    given_published_site
+    printf 'build = "just build"\nout = "%s"\nlfs = false\n' "$bad" \
+        > "$GITSITE_WORK/repo/gitsite.toml"
+    mkdir -p "$GITSITE_WORK/repo/.git" "$GITSITE_WORK/repo/sub"
+    fails_with "rejects out = '$bad'" "must not publish .git"
+    teardown
+done
+
+# A symlink pointing out of the output directory passed every string check:
+# [ -d ] follows it and `cp -r` copied the LINK, making the published directory
+# a symlink to the whole workspace.
+sandbox
+given_published_site
+printf 'build = "just build"\nout = "public"\nlfs = false\n' \
+    > "$GITSITE_WORK/repo/gitsite.toml"
+ln -s . "$GITSITE_WORK/repo/public"
+fails_with "rejects out = symlink to the checkout" "must be a directory inside the repo"
+teardown
+
+# ...and a dotted name that merely LOOKS like .git must still be allowed.
+for good in "site/.github" "public"; do
+    sandbox
+    printf 'build = "just build"\nout = "%s"\nlfs = false\n' "$good" \
+        > "$GITSITE_WORK/repo/gitsite.toml"
+    mkdir -p "$GITSITE_WORK/repo/$good"
+    echo "<h1>new</h1>" > "$GITSITE_WORK/repo/$good/index.html"
+    build_round > /dev/null 2>&1
+    check "accepts out = '$good'" "$(site_says)" "<h1>new</h1>"
+    teardown
+done
+
+# The published directory must never itself be a symlink, whatever out was.
+sandbox
+given_repo produces_output out
+build_round > /dev/null 2>&1
+check "publishes a real directory, not a link" \
+    "$([ -L "$GITSITE_WORK/site" ] && echo link || echo dir)" "dir"
+teardown
 
 echo
 printf '%d passed, %d failed\n' "$passed" "$failed"

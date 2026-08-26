@@ -116,10 +116,42 @@ build_round() {
 
     [ -f gitsite.toml ] || { log "gitsite.toml missing in $REPO@$REF"; return 1; }
 
-    local build out lfs
+    local build out lfs out_real checkout_real
     build=$(read_config build) || { log "gitsite.toml: no readable 'build'"; return 1; }
     out=$(read_config out)     || { log "gitsite.toml: no readable 'out'"; return 1; }
     lfs=$(read_config lfs 2>/dev/null) || lfs=false
+
+    # Resolve `out` before trusting it. This runs BEFORE the build: an invalid
+    # value used to cost a full build on every poll before being rejected.
+    #
+    # A string check is not enough, and the previous one was exactly that. It
+    # rejected "." but not "./", "./." or ".git"; and a repo committing a
+    # symlink `public -> .` passed every test, because `[ -d ]` follows
+    # symlinks and `cp -r` then copied the LINK. The published directory became
+    # a symlink to the whole workspace, .git included — the precise accident
+    # this guard exists to prevent.
+    #
+    # realpath -m resolves symlinks and .. without requiring the path to exist
+    # yet (the build has not run). Requiring it strictly BELOW the checkout
+    # rejects "", ".", "./", ".//", "..", absolute paths and symlink escapes in
+    # one comparison.
+    # Reject an absolute value before joining: "$CHECKOUT/$out" turns "/etc"
+    # into "/work/repo//etc", which normalises to a path INSIDE the checkout.
+    # It is not an escape, but it silently means something other than it says.
+    case "$out" in
+        /*) log "gitsite.toml: 'out' must be a directory inside the repo, relative to its root, got '$out'"; return 1 ;;
+    esac
+    out_real=$(realpath -m "$CHECKOUT/$out") || { log "gitsite.toml: cannot resolve 'out' ($out)"; return 1; }
+    checkout_real=$(realpath -m "$CHECKOUT")
+    case "$out_real" in
+        "$checkout_real"/?*) : ;;
+        *) log "gitsite.toml: 'out' must be a directory inside the repo, got '$out'"; return 1 ;;
+    esac
+    # .git as a path COMPONENT, not as a substring: "site/.github" and
+    # "public/.gitkeep" are legitimate output directories.
+    case "/${out_real#"$checkout_real"/}/" in
+        */.git/*) log "gitsite.toml: 'out' must not publish .git, got '$out'"; return 1 ;;
+    esac
 
     # direnv, not `nix develop`: the build commands call bare names that only
     # resolve once .envrc has run uv sync and put .venv/bin on PATH.
@@ -134,24 +166,15 @@ build_round() {
 
     run_in_env bash -c "$build" || { log "build failed"; return 1; }
 
-    # `out` comes from a file in someone else's repo, so check it points at a
-    # subdirectory and nothing else. `out = "."` would publish the entire
-    # checkout — including .git, and with it every commit the source repo ever
-    # had. That is a bad afternoon for anyone whose history is not meant to be
-    # public, and the kind of mistake that is only obvious afterwards.
-    case "$out" in
-        "" | "." | ".." | /* | *"/../"* | */.. | ../*)
-            log "gitsite.toml: 'out' must be a path inside the repo, got '$out'"
-            return 1
-            ;;
-    esac
-
-    [ -d "$CHECKOUT/$out" ] || { log "build produced no '$out' directory"; return 1; }
+    [ -d "$out_real" ] || { log "build produced no '$out' directory"; return 1; }
 
     # Atomic swap, never a build in place: a visitor must not be able to see a
     # half-written directory.
     rm -rf "$SITE.new" "$SITE.old"
-    cp -r "$CHECKOUT/$out" "$SITE.new" || { log "copy failed"; return 1; }
+    # Copy the CONTENTS, not the directory entry: `cp -r dir target` copies a
+    # symlinked dir as a symlink, `cp -r dir/. target/` cannot.
+    mkdir -p "$SITE.new" || { log "copy failed"; return 1; }
+    cp -r "$out_real/." "$SITE.new/" || { log "copy failed"; return 1; }
     [ -e "$SITE" ] && mv "$SITE" "$SITE.old"
     mv "$SITE.new" "$SITE" || { log "swap failed"; return 1; }
     rm -rf "$SITE.old"

@@ -61,9 +61,19 @@ out   = "public"         # katalogen det lägger resultatet i, relativt repots r
 lfs   = false            # kör git lfs pull före bygget
 ```
 
-`out` måste peka inuti repot. `.`, absoluta sökvägar och sökvägar som går uppåt
-avvisas — annars hade `out = "."` publicerat hela checkouten inklusive `.git`,
-och därmed appens hela historik.
+`out` måste peka på en katalog **under** repots rot. Sökvägen kanoniseras med
+`realpath` innan den godtas, så `.`, `./`, `..`, absoluta sökvägar och
+symlänkar som pekar ut ur katalogen avvisas — annars hade `out = "."`
+publicerat hela checkouten inklusive `.git`, och därmed appens hela historik.
+`.git` avvisas separat, som sökvägskomponent: `site/.github` är tillåtet.
+
+Kontrollen körs innan bygget, så ett felaktigt värde kostar inte ett bygge per
+pollvarv. Det som publiceras är katalogens *innehåll*, aldrig katalogposten
+själv — annars hade en symlänkad utkatalog blivit en symlänk i den servade
+katalogen.
+
+En symlänk *inuti* utkatalogen följer med som den är. Vill du hindra att den
+följs är det webbservern som avgör: `disable_symlinks on;` i nginx.
 
 Att byggkommandot bor i appen är avsiktligt: den som byter utkatalog ändrar
 filen i samma commit som orsakar bytet. Priset är att ett trasigt byggkommando
