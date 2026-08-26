@@ -5,10 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # GitHub has twice now accepted a push to main without creating a run for it.
-  # Without a manual trigger the only way to recover is an empty commit — junk
-  # history to work around someone else's dropped event. `gh workflow run Build`
-  # rebuilds the same commit instead.
+  # GitHub has twice now taken ~40 minutes to create a run for a push to main.
+  # The runs did arrive, but a wait that long is indistinguishable from a
+  # dropped event while you are staring at it, and without a manual trigger the
+  # only apparent way out is an empty commit — junk history to work around
+  # someone else's queue. `gh workflow run Build` re-runs the same commit.
   workflow_dispatch:
 
 jobs:
