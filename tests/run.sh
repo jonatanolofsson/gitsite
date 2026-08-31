@@ -71,7 +71,7 @@ STUB
     source "$RUNNER"
 }
 
-teardown() { rm -rf "$SB"; unset BUILD_EXIT FETCH_EXIT LFS_EXIT BUILD_SIDE_EFFECT NARHASH_ONCE; }
+teardown() { cd / || :; rm -rf "$SB"; unset BUILD_EXIT FETCH_EXIT LFS_EXIT BUILD_SIDE_EFFECT NARHASH_ONCE; }
 
 # Write a gitsite.toml and an output directory containing one page.
 given_repo() { # build_ok out_dir [lfs]
@@ -353,6 +353,57 @@ LAST_SUCCESS=""
 rm -rf "$GITSITE_WORK"
 write_status ok "x" 0
 check "an unwritable status file is not fatal" "$?" "0"
+teardown
+
+# --------------------------------------------------------------------------
+# The SIGHUP nudge. A pre-push hook sends it; the runner is supposed to poll
+# fast for a window rather than once, because the hook fires before git has
+# transferred anything.
+sandbox
+EAGER_UNTIL=0
+check "polls at the normal interval when not poked" "$(next_nap)" "${GITSITE_INTERVAL:-120}"
+poke > /dev/null
+check "poking switches to the eager interval" "$(next_nap)" "5"
+check "poking opens a window into the future" \
+    "$([ "$EAGER_UNTIL" -gt "$(date +%s)" ] && echo ja || echo nej)" "ja"
+EAGER_UNTIL=$(( $(date +%s) - 1 ))
+check "an expired window falls back to the normal interval" "$(next_nap)" "120"
+teardown
+
+# The window must be a window, not a permanent mode: a nudge that never expired
+# would leave every site polling every 5s forever after one push.
+# GITSITE_EAGER_WINDOW is read at startup, not at poke time, so it has to be
+# exported BEFORE the sandbox sources the runner — same as it works in a pod.
+export GITSITE_EAGER_WINDOW=1
+sandbox
+EAGER_UNTIL=0
+poke > /dev/null
+check "the window honours GITSITE_EAGER_WINDOW" \
+    "$([ "$EAGER_UNTIL" -le "$(( $(date +%s) + 1 ))" ] && echo ja || echo nej)" "ja"
+teardown
+unset GITSITE_EAGER_WINDOW
+
+# The one that matters, and the one a unit test of next_nap cannot reach: a
+# plain `sleep N` is NOT interruptible, because bash defers a trap until the
+# foreground command returns. If nap() ever goes back to a bare sleep this test
+# takes 30 seconds and fails; everything else here still passes.
+sandbox
+start=$(date +%s)
+GITSITE_REPO=x bash -c "source '$RUNNER'; nap 30" &
+napper=$!
+sleep 1
+kill -HUP "$napper" 2>/dev/null
+wait "$napper" 2>/dev/null
+elapsed=$(( $(date +%s) - start ))
+check "SIGHUP cuts a sleep short" "$([ "$elapsed" -lt 10 ] && echo ja || echo "nej (${elapsed}s)")" "ja"
+teardown
+
+# And without a signal it must actually wait, or the loop becomes a spin.
+sandbox
+start=$(date +%s)
+nap 2
+check "nap without a signal waits the full time" \
+    "$([ "$(( $(date +%s) - start ))" -ge 2 ] && echo ja || echo nej)" "ja"
 teardown
 
 echo

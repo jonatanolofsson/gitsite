@@ -47,6 +47,8 @@ använda den till ett vanligt hugo- eller npm-projekt behöver du lägga till en
 | `GITSITE_WORK` | `/work` | klonen och den byggda sajten (`$GITSITE_WORK/site`) |
 | `HOME` | *(krävs)* | skrivbar och beständig; direnv, uv och nix cachar där |
 | `TMPDIR` | `$GITSITE_WORK/tmp` | nix bygger devskalet här; lägg det på volymen, inte i containern |
+| `GITSITE_EAGER_INTERVAL` | `5` | pollintervall medan en knuff är aktiv, se nedan |
+| `GITSITE_EAGER_WINDOW` | `120` | hur länge en knuff håller i sig, sekunder |
 
 `HOME` **måste** sättas och peka någonstans skrivbart — runnern avbryter
 direkt annars. Imagen sätter `HOME=/home/gitsite`, vilket fungerar men ligger i
@@ -105,6 +107,37 @@ cachar dem i `HOME` och `/nix`.
 - **Något finns i katalogen från första sekunden.** Innan det första bygget är
   klart ligger en enkel "bygger…"-sida där, så att en webbserver inte svarar
   403 på en tom katalog.
+
+## Knuffa den när du vet att något kommit
+
+`SIGHUP` till byggaren betyder *en push är på väg*. Runnern går då över till att
+polla var `GITSITE_EAGER_INTERVAL` sekund i `GITSITE_EAGER_WINDOW` sekunder, och
+stänger fönstret så snart något faktiskt publicerats.
+
+```bash
+kubectl -n gitsite exec deploy/gitsite-<sajt> -c builder -- kill -HUP 1
+```
+
+**Varför ett fönster och inte en enda pollning?** Därför att git saknar
+post-push-hook. Den enda klienthook som ligger nära en push är `pre-push`, och
+den kör *innan* objekten överförts. En knuff därifrån som utlöste exakt ett
+`ls-remote` skulle nästan alltid se commiten före den man pushar, inte göra
+något, och lämna ändringen att vänta ut hela det vanliga intervallet ändå —
+triggern hade sett ut att fungera utan att köpa något. Ett fönster gör knuffen
+okänslig för den kapplöpningen: pushen landar inom sekunder och nästa snabbvarv
+tar den.
+
+Knuffen är en vink, aldrig en order. Ingenting i den publicerar något som den
+vanliga pollningen inte hade publicerat en minut senare, så en förlorad knuff
+gör sajten sen — inte fel. Ett `pre-push` som knuffar bör därför aldrig kunna
+stoppa en push.
+
+En detalj värd att känna till om man ändrar i runnern: `sleep N` går inte att
+avbryta. Bash kör en trap först när förgrundskommandot returnerat, så en signal
+under en vanlig sleep verkar upp till ett helt intervall för sent. Sleepen körs
+därför i bakgrunden med `wait`. Att trapen finns spelar också roll i sig:
+byggaren är PID 1, och kärnan levererar inte signaler till PID 1 som saknar
+handler.
 
 ## Att se om den mår bra
 

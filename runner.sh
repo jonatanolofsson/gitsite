@@ -16,6 +16,10 @@ set -uo pipefail
 REPO=${GITSITE_REPO:?GITSITE_REPO is required}
 REF=${GITSITE_REF:-main}
 INTERVAL=${GITSITE_INTERVAL:-120}
+# SIGHUP means "a push is on its way". See poke() for why it opens a window
+# rather than triggering one immediate poll.
+EAGER_INTERVAL=${GITSITE_EAGER_INTERVAL:-5}
+EAGER_WINDOW=${GITSITE_EAGER_WINDOW:-120}
 SSH_KEY=${GITSITE_SSH_KEY:-/etc/gitsite/ssh}
 WORK=${GITSITE_WORK:-/work}
 CHECKOUT="$WORK/repo"
@@ -28,6 +32,7 @@ STATUS="$WORK/status.json"
 # alternative is threading two more arguments through every call site.
 LAST_BUILT=""
 LAST_SUCCESS=""
+EAGER_UNTIL=0
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { log "FATAL: $*"; exit 1; }
@@ -208,6 +213,56 @@ build_round() {
     return 0
 }
 
+# --------------------------------------------------------------- the SIGHUP nudge
+
+# A push is coming. Poll fast for a while instead of polling once, right now.
+#
+# The reason is that git has no post-push hook: the only client-side hook near a
+# push is pre-push, which runs BEFORE the objects are transferred. A trigger
+# from there that caused one immediate `ls-remote` would usually see the commit
+# before the pushed one and do nothing, and the change would then wait out the
+# full interval anyway — the trigger would look like it worked while buying
+# nothing. Opening a window makes the nudge insensitive to that race: the push
+# lands within seconds and the next fast poll takes it.
+#
+# It stays a hint, never an order. Nothing here can publish anything the normal
+# poll would not have published a minute later; if the nudge is lost, the site
+# is late, not wrong.
+poke() {
+    EAGER_UNTIL=$(( $(date +%s) + EAGER_WINDOW ))
+    log "poked — polling every ${EAGER_INTERVAL}s for the next ${EAGER_WINDOW}s"
+}
+trap poke HUP
+
+# Seconds until the next poll.
+next_nap() {
+    if [ "$(date +%s)" -lt "$EAGER_UNTIL" ]; then
+        printf '%s\n' "$EAGER_INTERVAL"
+    else
+        printf '%s\n' "$INTERVAL"
+    fi
+}
+
+# A plain `sleep N` cannot be cut short. Bash runs a trap only once the
+# foreground command has returned, so a signal arriving during the sleep is
+# acted on up to INTERVAL seconds late — which for the default 120 s is most of
+# what the nudge was supposed to save. Backgrounding the sleep and waiting on it
+# lets the trap run the moment the signal arrives.
+#
+# It also matters that the trap exists at all: the builder is PID 1 in its
+# container, and the kernel does not deliver a signal to PID 1 unless that
+# process has installed a handler for it. Without `trap poke HUP` above, a
+# SIGHUP would be dropped silently rather than doing something visible.
+nap() {
+    local secs=$1 pid
+    sleep "$secs" &
+    pid=$!
+    wait "$pid" 2>/dev/null
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    return 0
+}
+
 # ----------------------------------------------------------------------- loop
 
 main() {
@@ -230,6 +285,9 @@ main() {
                 LAST_BUILT=$remote
                 LAST_SUCCESS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
                 fails=0
+                # What the window was open for has arrived; close it rather
+                # than spend the rest of it polling for nothing.
+                EAGER_UNTIL=0
                 log "published $remote"
                 write_status ok "$remote" 0
             else
@@ -240,7 +298,7 @@ main() {
                 write_status failing "$remote" "$fails"
             fi
         fi
-        sleep "$INTERVAL"
+        nap "$(next_nap)"
     done
 }
 
