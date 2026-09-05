@@ -32,11 +32,14 @@ SITE="$WORK/site"
 # anything in there is public. Status is for the operator, not the visitor.
 STATUS="$WORK/status.json"
 
-# Globals rather than locals in main(): write_status reads them, and the
-# alternative is threading two more arguments through every call site.
+# Globals rather than locals in main(): poll_round and write_status both read
+# them, and the alternative is threading four more arguments through every call
+# site. FAILS counts consecutive bad rounds and is reset by any round that
+# reaches the remote, whether or not it had anything to build.
 LAST_BUILT=""
 LAST_SUCCESS=""
 EAGER_UNTIL=0
+FAILS=0
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die() { log "FATAL: $*"; exit 1; }
@@ -270,39 +273,62 @@ nap() {
 
 # ----------------------------------------------------------------------- loop
 
+
+# One poll. Split out of main() so the tests can exercise a single round: the
+# loop below is `while true`, and the interesting behaviour is what one round
+# leaves behind in the status file.
+poll_round() {
+    local remote
+    # ls-remote rather than fetch: a round that finds nothing new costs one
+    # network call, so the interval can be short without being expensive.
+    remote=$(git -C "$CHECKOUT" ls-remote origin "$REF" 2>/dev/null | cut -f1)
+    if [ -z "$remote" ]; then
+        FAILS=$((FAILS + 1))
+        log "cannot reach $REPO — retrying in ${INTERVAL}s (failed $FAILS in a row)"
+        write_status unreachable "" "$FAILS"
+    elif [ "$remote" = "$LAST_BUILT" ]; then
+        # Nothing new — which is a SUCCESS, and saying so is the point.
+        #
+        # This branch used to do nothing at all, and that made the status file
+        # lie in the one direction that matters. A single transient blip writes
+        # `unreachable`; every healthy round afterwards took this branch and
+        # wrote nothing, so the file kept claiming the remote was unreachable
+        # until the next push happened to arrive — days, on a quiet repo, while
+        # the site was building and serving perfectly.
+        #
+        # Refreshing last_attempt here is also what makes the file a heartbeat.
+        # A runner wedged in a hung network call leaves a timestamp that stops
+        # advancing, and no other field can tell you that: consecutive_failures
+        # freezes at whatever it was, and `state` still reads whatever the last
+        # eventful round decided.
+        FAILS=0
+        write_status ok "$remote" 0
+    else
+        log "building $remote"
+        if build_round; then
+            LAST_BUILT=$remote
+            LAST_SUCCESS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            FAILS=0
+            # What the window was open for has arrived; close it rather
+            # than spend the rest of it polling for nothing.
+            EAGER_UNTIL=0
+            log "published $remote"
+            write_status ok "$remote" 0
+        else
+            FAILS=$((FAILS + 1))
+            # The count is the point. One failure is a bad commit and fixes
+            # itself; twenty is a broken deployment nobody has looked at.
+            log "keeping the previous site (failed $FAILS in a row)"
+            write_status failing "$remote" "$FAILS"
+        fi
+    fi
+}
+
 main() {
     setup
-    local remote fails=0
     write_status starting "" 0
     while true; do
-        # ls-remote rather than fetch: a round that finds nothing new costs one
-        # network call, so the interval can be short without being expensive.
-        remote=$(git -C "$CHECKOUT" ls-remote origin "$REF" 2>/dev/null | cut -f1)
-        if [ -z "$remote" ]; then
-            fails=$((fails + 1))
-            log "cannot reach $REPO — retrying in ${INTERVAL}s (failed $fails in a row)"
-            write_status unreachable "" "$fails"
-        elif [ "$remote" = "$LAST_BUILT" ]; then
-            :
-        else
-            log "building $remote"
-            if build_round; then
-                LAST_BUILT=$remote
-                LAST_SUCCESS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-                fails=0
-                # What the window was open for has arrived; close it rather
-                # than spend the rest of it polling for nothing.
-                EAGER_UNTIL=0
-                log "published $remote"
-                write_status ok "$remote" 0
-            else
-                fails=$((fails + 1))
-                # The count is the point. One failure is a bad commit and fixes
-                # itself; twenty is a broken deployment nobody has looked at.
-                log "keeping the previous site (failed $fails in a row)"
-                write_status failing "$remote" "$fails"
-            fi
-        fi
+        poll_round
         nap "$(next_nap)"
     done
 }

@@ -185,6 +185,14 @@ looks perfectly healthy. The runner therefore writes
 **outside** the served directory — the swap replaces that directory wholesale,
 and the status concerns operations, not the visitor.
 
+It is rewritten every round, including the quiet ones that find nothing to
+build. That is what makes `last_attempt` a heartbeat: a timestamp that stops
+advancing is a runner that has stopped, and no other field can tell you that —
+`consecutive_failures` freezes wherever it was and `state` keeps whatever the
+last eventful round decided. It is also what stops a single transient blip from
+leaving `unreachable` standing for days while the site builds and serves
+perfectly.
+
 It deliberately carries no error text. The reason is in the log, which is read
 anyway when something is wrong; copying build output into a status file means
 that whatever the build printed — paths, tokens, somebody else's error message

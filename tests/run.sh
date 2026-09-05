@@ -58,7 +58,11 @@ for a in "$@"; do
   case "$a" in
     fetch)      exit "${FETCH_EXIT:-0}" ;;
     reset)      exit 0 ;;
-    ls-remote)  echo -e "${REMOTE_SHA:-abc123}\trefs/heads/main"; exit 0 ;;
+    ls-remote)  # LS_REMOTE_EMPTY=1 is an unreachable remote: no stdout, like a
+                # failed connection. REMOTE_SHA="" cannot express this, because
+                # ${REMOTE_SHA:-abc123} falls back on an EMPTY value too.
+                [ "${LS_REMOTE_EMPTY:-0}" = "1" ] && exit 1
+                echo -e "${REMOTE_SHA:-abc123}\trefs/heads/main"; exit 0 ;;
     clone)      exit 0 ;;
   esac
 done
@@ -71,7 +75,7 @@ STUB
     source "$RUNNER"
 }
 
-teardown() { cd / || :; rm -rf "$SB"; unset BUILD_EXIT FETCH_EXIT LFS_EXIT BUILD_SIDE_EFFECT NARHASH_ONCE; }
+teardown() { cd / || :; rm -rf "$SB"; unset BUILD_EXIT FETCH_EXIT LFS_EXIT BUILD_SIDE_EFFECT NARHASH_ONCE LS_REMOTE_EMPTY; }
 
 # Write a gitsite.toml and an output directory containing one page.
 given_repo() { # build_ok out_dir [lfs]
@@ -404,6 +408,66 @@ start=$(date +%s)
 nap 2
 check "nap without a signal waits the full time" \
     "$([ "$(( $(date +%s) - start ))" -ge 2 ] && echo yes || echo no)" "yes"
+teardown
+# --------------------------------------------------------------------------
+# A round that reaches the remote and finds nothing new is a SUCCESS, and the
+# status file has to say so. This branch used to do nothing at all, which meant
+# one transient blip wrote `unreachable` and every healthy round afterwards
+# left it standing — markplan and mineria both claimed `unreachable` for four
+# days while building and serving the current commit.
+quiet_round() { # arrange a round where the remote matches what is published
+    mkdir -p "$GITSITE_WORK"
+    LAST_BUILT="abc123"          # what the git stub's ls-remote returns
+    LAST_SUCCESS="2026-01-01T00:00:00Z"
+}
+
+sandbox
+quiet_round
+FAILS=1
+write_status unreachable "" 1     # the blip
+poll_round > /dev/null 2>&1
+check "a quiet round clears a stale unreachable" "$(status_field state)" "ok"
+check "a quiet round resets the failure counter" "$(status_field consecutive_failures)" "0"
+check "and resets the in-memory counter too" "$FAILS" "0"
+teardown
+
+sandbox
+quiet_round
+poll_round > /dev/null 2>&1
+check "a quiet round keeps the published sha" "$(status_field published)" "abc123"
+check "a quiet round keeps last_success" "$(status_field last_success)" "2026-01-01T00:00:00Z"
+teardown
+
+# The heartbeat. A runner wedged in a hung network call leaves a last_attempt
+# that stops advancing — the only field that can reveal it, and only if quiet
+# rounds refresh it.
+sandbox
+quiet_round
+poll_round > /dev/null 2>&1
+first=$(status_field last_attempt)
+sleep 1
+poll_round > /dev/null 2>&1
+check "a quiet round advances last_attempt" \
+    "$([ "$(status_field last_attempt)" != "$first" ] && echo yes || echo no)" "yes"
+teardown
+
+# Every 120s per site, so it must stay silent or the log becomes unreadable.
+sandbox
+quiet_round
+check "a quiet round logs nothing" "$(poll_round 2>&1)" ""
+teardown
+
+# The failure path must still work — this is the branch the above must not break.
+sandbox
+mkdir -p "$GITSITE_WORK"
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_BUILT=""
+# shellcheck disable=SC2034  # read by write_status in the sourced runner
+LAST_SUCCESS=""
+FAILS=0
+LS_REMOTE_EMPTY=1 poll_round > /dev/null 2>&1
+check "an unreachable remote still reports unreachable" "$(status_field state)" "unreachable"
+check "and counts the failure" "$(status_field consecutive_failures)" "1"
 teardown
 
 echo
