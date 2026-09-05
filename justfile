@@ -1,4 +1,4 @@
-# gitsite — the generic build-and-serve container
+# gitsite — the generic build container
 
 # Run the runner's test suite
 test:

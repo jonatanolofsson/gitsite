@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# gitsite runner — follow a git ref, rebuild on change, serve what is in git.
+# gitsite runner — follow a git ref, rebuild on change, publish what is in git.
+#
+# Publish, not serve: the result is written to $GITSITE_WORK/site and a separate
+# web server exposes it. See deploy/ for the pod that does that, and the README
+# for why the split is deliberate.
 #
 # The container is generic. Everything specific to a site comes from two
 # places, and the split is deliberate:
@@ -62,11 +66,12 @@ setup() {
         cat > "$SITE/index.html" <<'HTML'
 <!doctype html>
 <meta charset="utf-8">
-<title>Bygger…</title>
+<title>Building…</title>
 <style>body{font:16px/1.6 system-ui,sans-serif;margin:15vh auto;max-width:32rem;padding:0 1.5rem;color:#26292e}</style>
-<h1>Bygger sajten</h1>
-<p>Första bygget tar en stund — beroenden hämtas och cachas. Sidan
-uppdateras av sig själv när den är klar; ladda om då och då.</p>
+<h1>Building the site</h1>
+<p>The first build takes a while — dependencies are fetched and cached. This
+page is replaced by the site itself once the build finishes; reload now and
+then.</p>
 HTML
     fi
 

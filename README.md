@@ -1,149 +1,179 @@
 # gitsite
 
-En byggcontainer som följer ett git-repo, bygger om när något landat och lägger
-resultatet i en katalog. Samma image för alla sajter — skillnaden ligger i
-konfigurationen.
+A build container that follows a git repo, rebuilds when something lands and
+puts the result in a directory. One image for every site — the difference is
+in the configuration.
 
-Den ersätter mönstret där en sajt byggs som en bieffekt av utvecklingsmiljön:
-då dör sajten när utvecklingspodden startar om, den byggs bara vid podstart,
-och det som publiceras är arbetsträdet — ocommitterat och allt.
+It replaces the pattern where a site is built as a side effect of the
+development environment: there the site dies when the dev pod restarts, it is
+only built at pod start, and what gets published is the working tree —
+uncommitted and all.
 
-## Vad den gör, och inte gör
+## What it does, and does not do
 
-**gitsite bygger. Den servar inte.** Containern klonar, bygger och skriver
-resultatet till `/work/site`. Att exponera den katalogen på HTTP är någon
-annans jobb — en webbserver i samma pod, en sidovagn, en volym som en befintlig
-server läser. Vi kör den med `nginx-unprivileged` i samma pod, men ingenting i
-containern förutsätter just det.
+**gitsite builds. It does not serve.** The container clones, builds and writes
+the result to `/work/site`. Exposing that directory over HTTP is a separate
+container's job — [`deploy/`](deploy/) is a pod that does it, with the nginx
+config we run in production.
 
-Den vet inte heller något om autentisering. Vad som står framför webbservern —
-en identity-proxy, basic auth, eller ingenting — är ditt val.
+That split is deliberate, not an omission, and it is worth stating why, because
+everything else in this repo assumes a web server is there — the runner even
+writes a placeholder page at startup so that server has something to answer
+with:
 
-## Förutsättning: appens repo måste ha nix och direnv
+- **A build is arbitrary code, and the listener should not share a container
+  with it.** The build command comes from the app's repo and runs as written, in
+  a container that also holds the SSH deploy key. The web container mounts
+  `/work` read-only and holds no key.
+- **Rolling the builder does not take the site down.** Update the builder image,
+  or watch a build fail, and the web container keeps answering.
+- **Some sites need a real web server regardless.** One of ours proxies
+  `/refresh` to a third container in the same pod. A static server baked into
+  this image would have been wrong there and redundant everywhere else.
 
-Bygget körs som `direnv exec . <build>` i det klonade repot. Det förutsätter
-att repot har en `.envrc` och normalt en `flake.nix`.
+The cost is real, and worth knowing before you copy the arrangement:
+`status.json` (below) cannot be reached over HTTP, only with `kubectl exec`;
+and `kubectl logs deploy/gitsite-<site>` gives you nginx rather than the
+builder — you want `-c builder`.
 
-Skälet är att byggkommandon i praktiken anropar bara kommandonamn — `hugo`,
-`mkdocs build`, `python -m mysite` — som förutsätter en miljö någon redan satt
-upp. `nix develop -c` räcker inte när `.envrc` också gör något (installerar
-Python-beroenden, lägger `.venv/bin` på PATH); direnv gör allt.
+It knows nothing about authentication either. What sits in front of the web
+server — an identity proxy, basic auth, or nothing — is your choice.
 
-**Ett repo utan `.envrc` kan alltså inte byggas av gitsite i dag.** Vill du
-använda den till ett vanligt hugo- eller npm-projekt behöver du lägga till en
-`.envrc` som sätter upp verktygen, eller ändra runnern så att den kan hoppa
-över direnv. Det senare tas gärna emot som en PR.
+## Prerequisite: the app's repo must have nix and direnv
 
-## Konfigurationen är delad
+The build runs as `direnv exec . <build>` in the cloned repo. That assumes the
+repo has an `.envrc` and normally a `flake.nix`.
 
-**Infrastrukturen äger** vilket repo som gäller, via miljövariabler:
+The reason is that build commands in practice call bare command names — `hugo`,
+`mkdocs build`, `python -m mysite` — which assume an environment somebody has
+already set up. `nix develop -c` is not enough when `.envrc` also does
+something (installs Python dependencies, puts `.venv/bin` on PATH); direnv does
+all of it.
 
-| Variabel | Förval | Betydelse |
+**A repo without an `.envrc` therefore cannot be built by gitsite today.** If
+you want to use it for an ordinary hugo or npm project you need to add an
+`.envrc` that sets up the tools, or change the runner so it can skip direnv.
+The latter is welcome as a PR.
+
+## The configuration is split
+
+**The infrastructure owns** which repo applies, through environment variables:
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `GITSITE_REPO` | *(krävs)* | klon-URL, normalt SSH med en read-only deploy key |
-| `GITSITE_REF` | `main` | grenen som följs |
-| `GITSITE_INTERVAL` | `120` | sekunder mellan pollningarna |
-| `GITSITE_SSH_KEY` | `/etc/gitsite/ssh` | privatnyckeln; saknas den antas anonym remote |
-| `GITSITE_WORK` | `/work` | klonen och den byggda sajten (`$GITSITE_WORK/site`) |
-| `HOME` | *(krävs)* | skrivbar och beständig; direnv, uv och nix cachar där |
-| `TMPDIR` | `$GITSITE_WORK/tmp` | nix bygger devskalet här; lägg det på volymen, inte i containern |
-| `GITSITE_EAGER_INTERVAL` | `5` | pollintervall medan en knuff är aktiv, se nedan |
-| `GITSITE_EAGER_WINDOW` | `120` | hur länge en knuff håller i sig, sekunder |
+| `GITSITE_REPO` | *(required)* | clone URL, normally SSH with a read-only deploy key |
+| `GITSITE_REF` | `main` | the branch that is followed |
+| `GITSITE_INTERVAL` | `120` | seconds between polls |
+| `GITSITE_SSH_KEY` | `/etc/gitsite/ssh` | the private key; if absent, an anonymous remote is assumed |
+| `GITSITE_WORK` | `/work` | the clone and the built site (`$GITSITE_WORK/site`) |
+| `HOME` | *(required)* | writable and persistent; direnv, uv and nix cache there |
+| `TMPDIR` | `$GITSITE_WORK/tmp` | nix builds the dev shell here; put it on the volume, not in the container |
+| `GITSITE_EAGER_INTERVAL` | `5` | poll interval while a nudge is active, see below |
+| `GITSITE_EAGER_WINDOW` | `120` | how long a nudge lasts, in seconds |
 
-`HOME` **måste** sättas och peka någonstans skrivbart — runnern avbryter
-direkt annars. Imagen sätter `HOME=/home/gitsite`, vilket fungerar men ligger i
-containerns eget lager: sätt den till något beständigt, annars hämtas alla
-beroenden om vid varje omstart.
+`HOME` **must** be set and point somewhere writable — the runner aborts
+immediately otherwise. The image sets `HOME=/home/gitsite`, which works but
+lives in the container's own layer: point it at something persistent, or every
+dependency is refetched on every restart.
 
-**Appen äger** hur den byggs, i en `gitsite.toml` i repots rot:
+**The app owns** how it is built, in a `gitsite.toml` at the repo root:
 
 ```toml
-build = "just build"     # kommandot som producerar sajten
-out   = "public"         # katalogen det lägger resultatet i, relativt repots rot
-lfs   = false            # kör git lfs pull före bygget
+build = "just build"     # the command that produces the site
+out   = "public"         # the directory it puts the result in, relative to the repo root
+lfs   = false            # run git lfs pull before the build
 ```
 
-`out` måste peka på en katalog **under** repots rot. Sökvägen kanoniseras med
-`realpath` innan den godtas, så `.`, `./`, `..`, absoluta sökvägar och
-symlänkar som pekar ut ur katalogen avvisas — annars hade `out = "."`
-publicerat hela checkouten inklusive `.git`, och därmed appens hela historik.
-`.git` avvisas separat, som sökvägskomponent: `site/.github` är tillåtet.
+`out` must point at a directory **below** the repo root. The path is
+canonicalised with `realpath` before it is accepted, so `.`, `./`, `..`,
+absolute paths and symlinks pointing out of the directory are rejected —
+otherwise `out = "."` would have published the whole checkout including `.git`,
+and with it the app's entire history. `.git` is rejected separately, as a path
+component: `site/.github` is allowed.
 
-Kontrollen körs innan bygget, så ett felaktigt värde kostar inte ett bygge per
-pollvarv. Det som publiceras är katalogens *innehåll*, aldrig katalogposten
-själv — annars hade en symlänkad utkatalog blivit en symlänk i den servade
-katalogen.
+The check runs before the build, so a bad value does not cost one build per
+poll round. What gets published is the *contents* of the directory, never the
+directory entry itself — otherwise a symlinked output directory would have
+become a symlink in the served directory.
 
-En symlänk *inuti* utkatalogen följer med som den är. Vill du hindra att den
-följs är det webbservern som avgör: `disable_symlinks on;` i nginx.
+A symlink *inside* the output directory is carried over as it is. If you want
+to stop it being followed, that is for the web server to decide:
+`disable_symlinks on;` in nginx.
 
-Att byggkommandot bor i appen är avsiktligt: den som byter utkatalog ändrar
-filen i samma commit som orsakar bytet. Priset är att ett trasigt byggkommando
-upptäcks först i containern — därför behandlas en saknad eller ogiltig
-`gitsite.toml` som ett byggfel, och den förra sajten står kvar.
+The build command living in the app is deliberate: whoever changes the output
+directory changes the file in the same commit that causes the change. The price
+is that a broken build command is only discovered in the container — which is
+why a missing or invalid `gitsite.toml` is treated as a build failure, and the
+previous site stays up.
 
-## Kom igång
+## Getting started
 
 ```bash
 docker run --rm \
-  -e GITSITE_REPO=https://github.com/dig/din-sajt.git \
+  -e GITSITE_REPO=https://github.com/you/your-site.git \
   -e HOME=/work/home \
   -v gitsite-data:/work \
   ghcr.io/jonatanolofsson/gitsite:latest
 ```
 
-Sajten hamnar i `/work/site`. Peka en webbserver på den katalogen — **inte på
-en montering av den**, se nedan.
+The site ends up in `/work/site`. Point a web server at that directory — **not
+at a mount of it**, see below.
 
-Första bygget tar minuter, inte sekunder: nix hämtar appens beroenden och
-cachar dem i `HOME` och `/nix`.
+The first build takes minutes, not seconds: nix fetches the app's dependencies
+and caches them in `HOME` and `/nix`.
 
-## Vad som är garanterat
+On Kubernetes, [`deploy/`](deploy/) is the whole arrangement — builder, web
+server, volume and deploy key — with the parts that look like detail and are
+not called out in [`deploy/README.md`](deploy/README.md).
 
-- **Ett misslyckat bygge tar aldrig ner sajten.** Förra versionen står kvar och
-  runnern försöker igen nästa varv.
-- **Ett tomt pollvarv kostar ett nätanrop.** `git ls-remote` jämförs mot senast
-  byggda commit; först vid skillnad hämtas något.
-- **Något finns i katalogen från första sekunden.** Innan det första bygget är
-  klart ligger en enkel "bygger…"-sida där, så att en webbserver inte svarar
-  403 på en tom katalog.
+## What is guaranteed
 
-## Knuffa den när du vet att något kommit
+- **A failed build never takes the site down.** The previous version stays up
+  and the runner tries again next round.
+- **An empty poll round costs one network call.** `git ls-remote` is compared
+  against the last built commit; only on a difference is anything fetched.
+- **There is something in the directory from the first second.** Before the
+  first build finishes, a simple "building…" page sits there, so a web server
+  does not answer 403 on an empty directory.
 
-`SIGHUP` till byggaren betyder *en push är på väg*. Runnern går då över till att
-polla var `GITSITE_EAGER_INTERVAL` sekund i `GITSITE_EAGER_WINDOW` sekunder, och
-stänger fönstret så snart något faktiskt publicerats.
+## Nudge it when you know something has landed
+
+`SIGHUP` to the builder means *a push is on its way*. The runner then switches
+to polling every `GITSITE_EAGER_INTERVAL` seconds for `GITSITE_EAGER_WINDOW`
+seconds, and closes the window as soon as something has actually been
+published.
 
 ```bash
-kubectl -n gitsite exec deploy/gitsite-<sajt> -c builder -- kill -HUP 1
+kubectl -n gitsite exec deploy/gitsite-<site> -c builder -- kill -HUP 1
 ```
 
-**Varför ett fönster och inte en enda pollning?** Därför att git saknar
-post-push-hook. Den enda klienthook som ligger nära en push är `pre-push`, och
-den kör *innan* objekten överförts. En knuff därifrån som utlöste exakt ett
-`ls-remote` skulle nästan alltid se commiten före den man pushar, inte göra
-något, och lämna ändringen att vänta ut hela det vanliga intervallet ändå —
-triggern hade sett ut att fungera utan att köpa något. Ett fönster gör knuffen
-okänslig för den kapplöpningen: pushen landar inom sekunder och nästa snabbvarv
-tar den.
+**Why a window and not a single poll?** Because git has no post-push hook. The
+only client-side hook near a push is `pre-push`, and it runs *before* the
+objects have been transferred. A nudge from there that triggered exactly one
+`ls-remote` would almost always see the commit before the one being pushed, do
+nothing, and leave the change to wait out the whole ordinary interval anyway —
+the trigger would look like it worked without buying anything. A window makes
+the nudge insensitive to that race: the push lands within seconds and the next
+fast round takes it.
 
-Knuffen är en vink, aldrig en order. Ingenting i den publicerar något som den
-vanliga pollningen inte hade publicerat en minut senare, så en förlorad knuff
-gör sajten sen — inte fel. Ett `pre-push` som knuffar bör därför aldrig kunna
-stoppa en push.
+The nudge is a hint, never an order. Nothing in it publishes anything the
+ordinary poll would not have published a minute later, so a lost nudge makes
+the site late — not wrong. A `pre-push` that nudges should therefore never be
+able to stop a push.
 
-En detalj värd att känna till om man ändrar i runnern: `sleep N` går inte att
-avbryta. Bash kör en trap först när förgrundskommandot returnerat, så en signal
-under en vanlig sleep verkar upp till ett helt intervall för sent. Sleepen körs
-därför i bakgrunden med `wait`. Att trapen finns spelar också roll i sig:
-byggaren är PID 1, och kärnan levererar inte signaler till PID 1 som saknar
-handler.
+One detail worth knowing if you change the runner: `sleep N` cannot be cut
+short. Bash runs a trap only once the foreground command has returned, so a
+signal during an ordinary sleep takes effect up to a whole interval late. The
+sleep is therefore run in the background with `wait`. That the trap exists at
+all also matters in itself: the builder is PID 1, and the kernel does not
+deliver signals to a PID 1 that has no handler.
 
-## Att se om den mår bra
+## Seeing whether it is well
 
-Garantin ovan har en baksida: **ett bygge som misslyckas varje varv syns inte
-utifrån.** Sajten svarar 200 med förra veckans innehåll och ser fullt frisk ut.
-Därför skriver runnern `$GITSITE_WORK/status.json` efter varje varv:
+The guarantee above has a flip side: **a build that fails every round is
+invisible from outside.** The site answers 200 with last week's content and
+looks perfectly healthy. The runner therefore writes
+`$GITSITE_WORK/status.json` after every round:
 
 ```json
 {"state":"failing","ref":"main","attempted":"9f2c…","published":"4a71…",
@@ -151,70 +181,70 @@ Därför skriver runnern `$GITSITE_WORK/status.json` efter varje varv:
  "last_success":"2026-08-24T09:31:55Z"}
 ```
 
-`state` är `ok`, `failing`, `unreachable` eller `starting`. Filen ligger
-**utanför** den servade katalogen — bytet ersätter den katalogen i sin helhet,
-och statusen angår driften, inte besökaren.
+`state` is `ok`, `failing`, `unreachable` or `starting`. The file lies
+**outside** the served directory — the swap replaces that directory wholesale,
+and the status concerns operations, not the visitor.
 
-Den bär medvetet ingen feltext. Orsaken står i loggen, som ändå läses när något
-är fel; att kopiera in byggutdata i en statusfil betyder att vad bygget än
-skrev — sökvägar, tokens, någon annans felmeddelande — hamnar någonstans det
-aldrig granskats för.
+It deliberately carries no error text. The reason is in the log, which is read
+anyway when something is wrong; copying build output into a status file means
+that whatever the build printed — paths, tokens, somebody else's error message
+— ends up somewhere it was never reviewed for.
 
-Det billigaste larmet är på loggen, som skriver en räknare just för det:
+The cheapest alarm is on the log, which prints a counter for exactly this:
 
 ```
 keeping the previous site (failed 7 in a row)
 ```
 
-En enstaka etta är en trasig commit som lagar sig själv. Ett tvåsiffrigt tal är
-en deploy ingen tittat på. Larma på det andra, inte på det första.
+A lone one is a broken commit that fixes itself. A two-digit number is a deploy
+nobody has looked at. Alarm on the second, not on the first.
 
-## Kända begränsningar
+## Known limitations
 
-- **Publiceringen är inte atomär i strikt mening.** Bygget sker vid sidan om
-  och katalogen byts med två `mv` — mellan dem finns ett kort glapp där
-  `site/` inte existerar. Dör containern precis där ligger bygget kvar som
-  `site.new` och nästa varv publicerar om.
-- **Montera inte `site/` direkt.** Bytet ersätter katalogens inode, så en
-  bind-montering av just `site/` fortsätter peka på den gamla och servar första
-  bygget för alltid. Montera föräldern och låt webbservern lösa sökvägen per
-  förfrågan.
-- **Byggkommandot kommer från appens repo och körs som det står.** Den som kan
-  pusha till app-repot kan köra godtycklig kod i containern. Det är oundvikligt
-  — ett bygge *är* godtycklig kod — men det är skälet att deploy-nyckeln bör
-  vara read-only och per repo, och att containern inte bör ha några andra
-  rättigheter.
-- Ett repo utan `.envrc` stöds inte, se ovan.
-- **Lägger du `/nix` på en volym som överlever imagen — slå ihop, seeda inte.**
-  Imagens `$HOME/.nix-profile` ligger i containerlagret men symlänkar in i
-  `/nix`. Kopierar du bara storen när volymen är tom fastnar den i den version
-  som råkade komma först, och en nyare image får ett profilbibliotek utan mål:
-  `direnv: command not found` vid varje bygge. `cp -a -n /nix/. <volym>/`
-  lägger till det som saknas utan att röra det som finns — säkert eftersom
-  store-sökvägar är innehållsadresserade och oföränderliga.
+- **Publishing is not atomic in the strict sense.** The build happens off to
+  the side and the directory is swapped with two `mv`s — between them there is
+  a brief gap where `site/` does not exist. If the container dies right there,
+  the build is left as `site.new` and the next round republishes.
+- **Do not mount `site/` directly.** The swap replaces the directory's inode,
+  so a bind mount of `site/` specifically keeps pointing at the old one and
+  serves the first build forever. Mount the parent and let the web server
+  resolve the path per request.
+- **The build command comes from the app's repo and is run as written.**
+  Whoever can push to the app repo can run arbitrary code in the container.
+  That is unavoidable — a build *is* arbitrary code — but it is the reason the
+  deploy key should be read-only and per repo, and the container should have no
+  other privileges.
+- A repo without an `.envrc` is not supported, see above.
+- **If you put `/nix` on a volume that outlives the image — merge, do not
+  seed.** The image's `$HOME/.nix-profile` lives in the container layer but
+  symlinks into `/nix`. If you only copy the store when the volume is empty it
+  is stuck at whichever version happened to come first, and a newer image gets
+  a profile of links with no targets: `direnv: command not found` on every
+  build. `cp -a -n /nix/. <volume>/` adds what is missing without touching what
+  is there — safe because store paths are content-addressed and immutable.
 
-## Utveckling
+## Development
 
 ```
 just check     # lint + test
-just test      # bara testerna
+just test      # tests only
 just lint      # shellcheck
 ```
 
-Testerna kör utan ramverk och stubbar `git`, `direnv` och `nix`. Tyngdpunkten
-ligger på felvägarna: att ett trasigt bygge behåller förra sajten, att en
-ogiltig `gitsite.toml` inte publiceras, och att `out` inte kan peka ut ur
-repot.
+The tests run without a framework and stub `git`, `direnv` and `nix`. The
+emphasis is on the failure paths: that a broken build keeps the previous site,
+that an invalid `gitsite.toml` is not published, and that `out` cannot point
+out of the repo.
 
-Verktygen deklareras i `flake.nix` så att `just check` fungerar i varje miljö,
-inte bara där en python råkar vara installerad. CI kör exakt samma `just check`
-genom samma nix-skal.
+The tools are declared in `flake.nix` so that `just check` works in every
+environment, not only where a python happens to be installed. CI runs exactly
+the same `just check` through the same nix shell.
 
-Imagen pinnar både nix-versionen och nixpkgs-revisionen (`ARG` överst i
-`Dockerfile`). Revisionen är densamma som `flake.lock` — imagens direnv och
-utvecklingsskalet kommer ur samma nixpkgs. **Bumpa dem tillsammans**, annars
-säger repot en sak och imagen en annan.
+The image pins both the nix version and the nixpkgs revision (`ARG` at the top
+of the `Dockerfile`). The revision is the same as `flake.lock` — the image's
+direnv and the development shell come out of the same nixpkgs. **Bump them
+together**, or the repo says one thing and the image another.
 
-## Licens
+## Licence
 
-MIT, se [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

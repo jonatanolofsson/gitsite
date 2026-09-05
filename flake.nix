@@ -1,5 +1,5 @@
 {
-  description = "gitsite — follow a git ref, rebuild on change, serve what is in git";
+  description = "gitsite — follow a git ref, rebuild on change, publish what is in git";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/release-25.11";

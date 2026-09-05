@@ -94,15 +94,15 @@ site_says() { cat "$GITSITE_WORK/site/index.html" 2> /dev/null; }
 # therefore proves nothing about WHICH check fired — four of the original five
 # `out` tests passed with the guard deleted, for unrelated reasons. Assert the
 # log line too.
-fails_with() { # beskrivning mönster
+fails_with() { # description pattern
     local out rc
     out=$(build_round 2>&1); rc=$?
     if [ "$rc" -eq 0 ]; then
-        nope "$1" "build_round lyckades, väntade fel"
+        nope "$1" "build_round succeeded, expected a failure"
     elif printf '%s' "$out" | grep -q "$2"; then
         ok "$1"
     else
-        nope "$1" "fel orsak; väntade /$2/, fick: $(printf '%s' "$out" | tail -1)"
+        nope "$1" "wrong reason; expected /$2/, got: $(printf '%s' "$out" | tail -1)"
     fi
 }
 
@@ -365,7 +365,7 @@ check "polls at the normal interval when not poked" "$(next_nap)" "${GITSITE_INT
 poke > /dev/null
 check "poking switches to the eager interval" "$(next_nap)" "5"
 check "poking opens a window into the future" \
-    "$([ "$EAGER_UNTIL" -gt "$(date +%s)" ] && echo ja || echo nej)" "ja"
+    "$([ "$EAGER_UNTIL" -gt "$(date +%s)" ] && echo yes || echo no)" "yes"
 EAGER_UNTIL=$(( $(date +%s) - 1 ))
 check "an expired window falls back to the normal interval" "$(next_nap)" "120"
 teardown
@@ -379,7 +379,7 @@ sandbox
 EAGER_UNTIL=0
 poke > /dev/null
 check "the window honours GITSITE_EAGER_WINDOW" \
-    "$([ "$EAGER_UNTIL" -le "$(( $(date +%s) + 1 ))" ] && echo ja || echo nej)" "ja"
+    "$([ "$EAGER_UNTIL" -le "$(( $(date +%s) + 1 ))" ] && echo yes || echo no)" "yes"
 teardown
 unset GITSITE_EAGER_WINDOW
 
@@ -395,7 +395,7 @@ sleep 1
 kill -HUP "$napper" 2>/dev/null
 wait "$napper" 2>/dev/null
 elapsed=$(( $(date +%s) - start ))
-check "SIGHUP cuts a sleep short" "$([ "$elapsed" -lt 10 ] && echo ja || echo "nej (${elapsed}s)")" "ja"
+check "SIGHUP cuts a sleep short" "$([ "$elapsed" -lt 10 ] && echo yes || echo "no (${elapsed}s)")" "yes"
 teardown
 
 # And without a signal it must actually wait, or the loop becomes a spin.
@@ -403,7 +403,7 @@ sandbox
 start=$(date +%s)
 nap 2
 check "nap without a signal waits the full time" \
-    "$([ "$(( $(date +%s) - start ))" -ge 2 ] && echo ja || echo nej)" "ja"
+    "$([ "$(( $(date +%s) - start ))" -ge 2 ] && echo yes || echo no)" "yes"
 teardown
 
 echo

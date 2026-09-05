@@ -1,0 +1,171 @@
+---
+# A reference gitsite pod: builder + web server, one PVC, one deploy key.
+#
+# Copy it per site and substitute SITE (a short name) and REPO. Everything the
+# app owns — the build command, the output directory, git-lfs — lives in that
+# repo's own gitsite.toml, not here.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitsite-SITE
+  labels: {app: gitsite, site: SITE}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      # Mounted twice by subPath: `nix` is the store, `work` is HOME, the
+      # clone, and the published site. The store dominates — measure it for
+      # your app's flake rather than trusting this number.
+      storage: 8Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitsite-SITE
+  labels: {app: gitsite, site: SITE}
+data:
+  GITSITE_REPO: git@github.com:you/REPO.git
+  GITSITE_REF: main
+  GITSITE_INTERVAL: "120"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitsite-nginx
+data:
+  # The contents of deploy/nginx.conf. One shared ConfigMap serves every site
+  # that only needs static files; a site needing more — a proxy to another
+  # container, its own headers — gets its own and overrides the volume below.
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+        root /work/site;
+        index index.html;
+        disable_symlinks on;
+        location / {
+            try_files $uri $uri/ =404;
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitsite-SITE
+  labels: {app: gitsite, site: SITE}
+spec:
+  replicas: 1
+  # The PVC is RWO: the new pod cannot mount it until the old one lets go.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: gitsite, site: SITE}
+  template:
+    metadata:
+      labels: {app: gitsite, site: SITE}
+    spec:
+      # The image installs nix as uid 1000 rather than as root, which is what
+      # lets this satisfy PodSecurity "restricted" with no escalation. fsGroup
+      # owns both subPaths, so uid 1000 can write the nix store;
+      # OnRootMismatch keeps restarts fast — without it kubelet walks the whole
+      # store applying group ownership on every start.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # MERGE the image's nix store onto the PVC, never seed it once. The
+        # image's $HOME/.nix-profile lives in the container layer but symlinks
+        # into /nix; a copy that only runs when the volume is empty pins the
+        # store at whichever image came first, and a newer image then gets a
+        # profile of dangling links — "direnv: command not found" on every
+        # build. `cp -a -n` adds what is missing and touches nothing that
+        # exists, which is safe because store paths are content-addressed and
+        # immutable.
+        - name: merge-nix
+          image: ghcr.io/jonatanolofsson/gitsite:latest
+          command: ["sh", "-c", "cp -a -n /nix/. /mnt/nix/"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: data, mountPath: /mnt/nix, subPath: nix}
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {memory: "1Gi"}
+      containers:
+        # Runs the app repo's build command as written, and holds the deploy
+        # key. Deliberately not the container that listens on the network.
+        - name: builder
+          # Pin the immutable sha- tag in a real deployment, so a rollback is a
+          # one-line change rather than a rebuild.
+          image: ghcr.io/jonatanolofsson/gitsite:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          envFrom:
+            - configMapRef: {name: gitsite-SITE}
+          env:
+            # HOME must be writable AND persistent, or every dependency is
+            # refetched on each restart. TMPDIR belongs on the volume too: nix
+            # builds the dev shell there, and it would otherwise eat the node's
+            # ephemeral storage.
+            - {name: HOME, value: /work/home}
+            - {name: GITSITE_SSH_KEY, value: /etc/gitsite/ssh}
+            - {name: TMPDIR, value: /work/tmp}
+          volumeMounts:
+            - {name: data, mountPath: /work, subPath: work}
+            - {name: data, mountPath: /nix, subPath: nix}
+            - {name: deploykey, mountPath: /etc/gitsite, readOnly: true}
+          resources:
+            requests: {cpu: "200m", memory: "512Mi"}
+            limits: {memory: "4Gi"}
+        # Read-only, no deploy key, and it does not restart when a build fails
+        # or the builder image is rolled — the site keeps answering.
+        - name: web
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+          volumeMounts:
+            # The PARENT of the published directory, not the directory itself.
+            - {name: data, mountPath: /work, subPath: work, readOnly: true}
+            - {name: nginx, mountPath: /etc/nginx/conf.d/default.conf, subPath: default.conf, readOnly: true}
+          readinessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: http}
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            requests: {cpu: "10m", memory: "32Mi"}
+            limits: {memory: "128Mi"}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: gitsite-SITE}
+        - name: deploykey
+          secret:
+            # A read-only deploy key, per repo. Whoever can push to the app
+            # repo can run arbitrary code in the builder, so this key should
+            # open nothing else.
+            secretName: gitsite-deploykeys
+            items: [{key: SITE, path: ssh, mode: 0400}]
+        - name: nginx
+          configMap: {name: gitsite-nginx}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitsite-SITE
+  labels: {app: gitsite, site: SITE}
+spec:
+  selector:
+    app: gitsite
+    site: SITE
+  ports:
+    - {port: 8080, targetPort: http, name: http}
