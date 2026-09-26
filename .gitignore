@@ -1,1 +1,4 @@
 .direnv/
+# ct convention: ~/dev/.env and ~/dev/.kubeconfig are symlinked into every clone
+.env
+.kubeconfig
