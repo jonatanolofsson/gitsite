@@ -14,6 +14,9 @@ ARG GID=1000
 
 RUN set -eux; \
     apt-get update; \
+    # Security fixes the base image doesn't carry yet: a rebuild then picks up
+    # Debian's patched packages, not only the date the base image was cut.
+    apt-get upgrade -y --no-install-recommends; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl xz-utils git git-lfs python3 openssh-client bash; \
     rm -rf /var/lib/apt/lists/*; \
